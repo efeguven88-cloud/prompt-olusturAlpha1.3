@@ -1,0 +1,119 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Kodu indir
+        uses: actions/checkout@v4
+
+      - name: Node.js kur
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Java 21 kur
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Gradle önbelleği
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Bağımlılıkları kur
+        run: npm install
+
+      - name: www klasörünü hazırla
+        run: |
+          mkdir -p www
+          if [ ! -f www/index.html ] && [ -f index.html ]; then
+            cp index.html www/index.html
+          fi
+          ls -la www
+
+      - name: Android platformunu ekle (yoksa)
+        run: |
+          if [ ! -d android ]; then
+            npx cap add android
+          fi
+
+      - name: İkon ve splash üret (assets klasörü varsa)
+        run: |
+          if [ -d assets ]; then
+            npm install --no-save @capacitor/assets
+            npx capacitor-assets generate --android || echo "Assets üretilemedi, atlandı"
+          else
+            echo "assets klasörü yok, atlandı"
+          fi
+
+      - name: AndroidManifest izinlerini ekle (mikrofon)
+        run: |
+          python3 - <<'PY'
+          p = "android/app/src/main/AndroidManifest.xml"
+          s = open(p, encoding="utf-8").read()
+          add = ""
+          if "android.permission.RECORD_AUDIO" not in s:
+              add += '    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n'
+          if "android.permission.INTERNET" not in s:
+              add += '    <uses-permission android:name="android.permission.INTERNET" />\n'
+          if "android.speech.RecognitionService" not in s:
+              add += ('    <queries>\n'
+                      '        <intent>\n'
+                      '            <action android:name="android.speech.RecognitionService" />\n'
+                      '        </intent>\n'
+                      '    </queries>\n')
+          s = s.replace("</manifest>", add + "</manifest>")
+          open(p, "w", encoding="utf-8").write(s)
+          PY
+
+      - name: Web dosyalarını Android'e senkronla
+        run: npx cap sync android
+
+      - name: İmza anahtarını hazırla (secret varsa)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > android/app/release.keystore
+            echo "SIGNED=true" >> $GITHUB_ENV
+          else
+            echo "SIGNED=false" >> $GITHUB_ENV
+          fi
+
+      - name: Debug APK derle (imza anahtarı yoksa)
+        if: env.SIGNED == 'false'
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Release APK derle ve imzala (imza anahtarı varsa)
+        if: env.SIGNED == 'true'
+        working-directory: android
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file=$GITHUB_WORKSPACE/android/app/release.keystore \
+            -Pandroid.injected.signing.store.password=$KEYSTORE_PASSWORD \
+            -Pandroid.injected.signing.key.alias=$KEY_ALIAS \
+            -Pandroid.injected.signing.key.password=$KEY_PASSWORD
+
+      - name: APK'yı yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: prompt-olustur-apk
+          path: |
+            android/app/build/outputs/apk/debug/*.apk
+            android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
